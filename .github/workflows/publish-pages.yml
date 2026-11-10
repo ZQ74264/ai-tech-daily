@@ -1,0 +1,92 @@
+name: Publish AI Tech Daily
+
+on:
+  push:
+    branches: [main]
+    paths: [index.html]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Deploy the verified report to the public site
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: ai-tech-daily-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      checksum: ${{ steps.report.outputs.checksum }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate the formal edition
+        id: report
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          from datetime import datetime
+          from pathlib import Path
+
+          html = Path('index.html').read_text(encoding='utf-8')
+          match = re.search(r'<script id="issue-data" type="application/json">(.*?)</script>', html, re.S)
+          if not match:
+              raise SystemExit('Missing report data.')
+          issue = json.loads(match[1])[0]
+          if issue.get('live') is not False or not issue['id'].endswith('-daily'):
+              raise SystemExit('Expected the formal daily edition.')
+          checked = datetime.fromisoformat(issue['latestBatch']['checked'])
+          verified = datetime.fromisoformat(issue['pageVerification'])
+          if (checked.tzinfo is None or verified.tzinfo is None or
+                  checked.date().isoformat() != issue['day'] or verified < checked):
+              raise SystemExit('The collection or browser verification time is invalid.')
+          print(f"Edition {issue['day']} | collection {checked.isoformat()} | coverage {issue['latestBatch']['coverage']}")
+          PY
+          mkdir _site
+          cp index.html _site/index.html
+          echo "checksum=$(sha256sum _site/index.html | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name == 'push' || inputs.publish
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Check the published HTTPS response
+        env:
+          EXPECTED_SHA256: ${{ needs.build.outputs.checksum }}
+        run: |
+          for attempt in {1..18}; do
+            if curl --fail --silent --show-error --compressed --max-time 10 \
+                --output live.html \
+                "https://zq74264.github.io/ai-tech-daily/?run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$attempt" &&
+                printf '%s  live.html\n' "$EXPECTED_SHA256" | sha256sum --check; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::The public HTTPS response did not match the verified report."
+          exit 1
